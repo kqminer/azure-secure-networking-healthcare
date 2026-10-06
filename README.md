@@ -1,428 +1,252 @@
-# Secure Azure Networking for a Healthcare Application Environment
+# Secure Azure Network Segmentation for a Patient Application
 
 ## Overview
 
-This project demonstrates the design and configuration of a segmented Azure network for a fictional healthcare organization, **Contoso Health Services**.
+In this AZ-104 lab, I built and tested a two-tier Azure network for a patient application. I placed the web and data workloads in separate subnets, used Network Security Groups (NSGs) to control traffic between them, and deployed two Windows Server VMs without public IP addresses.
 
-The environment separates application, data, and management workloads while implementing Network Security Groups, VNet peering, custom routing, Azure Private Link, private DNS, and Storage network isolation.
-
-The project builds on previous Azure identity/governance and storage projects by securing access to an existing Azure Storage account through a private endpoint and disabling its public network endpoint.
+The goal was simple: allow the web tier to reach the data tier on TCP port `1433`, but block other traffic such as RDP on port `3389`. I tested both paths, used Network Watcher to confirm which NSG rules made the decisions, and deleted the environment after the lab to avoid ongoing charges.
 
 ## Business Scenario
 
-Contoso Health Services is developing a patient-services application in Azure.
+A healthcare application has a web tier and a data tier. The web server needs to communicate with the data server, but it should only have the access the application requires.
 
-The application environment requires:
+The network needed to:
 
-- Separate subnets for application, data, and management workloads
-- Restricted administrative access
-- Private connectivity between application and shared-services VNets
-- Private access to Azure Blob Storage
-- Private DNS resolution for the Storage endpoint
-- Custom routing and route troubleshooting
-- Storage isolation from the public internet
+- Place the web and data tiers in separate subnets
+- Apply security rules at the subnet level
+- Allow HTTP traffic from the internet to the web subnet
+- Allow TCP `1433` from the web subnet to the data subnet
+- Block other inbound VNet traffic to the data subnet
+- Keep both VMs private with no public IP addresses
+- Prove that the allowed connection worked and the unwanted connection was blocked
+- Remove the lab resources after testing
 
 ## Architecture
 
 ```text
-Azure Subscription
-│
-├── rg-contoso-patientapp-dev
-│   │
-│   └── stpatientappdev280
-│       ├── Public network access: Disabled
-│       └── Blob Private Endpoint
-│
-└── rg-contoso-network-dev
-    │
-    ├── vnet-patientapp-dev
-    │   │
-    │   ├── snet-app
-    │   │   └── 10.20.1.0/24
-    │   │
-    │   ├── snet-data
-    │   │   ├── 10.20.2.0/24
-    │   │   └── Storage Private Endpoint
-    │   │
-    │   └── snet-mgmt
-    │       └── 10.20.3.0/24
-    │
-    ├── nsg-patientapp-app
-    │   ├── Allow RDP from management subnet
-    │   └── Deny RDP from other VNet sources
-    │
-    ├── rt-patientapp-app
-    │
-    ├── vnet-sharedservices-dev
-    │   └── snet-shared
-    │       └── 10.30.1.0/24
-    │
-    ├── VNet Peering
-    │
-    └── Private DNS
-        └── privatelink.blob.core.windows.net
+Azure subscription
+└── rg-patientapp-net-dev (Central US)
+    └── vnet-patientapp-dev-cus-001 — 10.20.0.0/16
+        ├── snet-web-dev-cus-001 — 10.20.1.0/24
+        │   ├── nsg-web-dev-cus-001
+        │   └── vm-patientapp-web-dev-001 — 10.20.1.4
+        └── snet-data-dev-cus-001 — 10.20.2.0/24
+            ├── nsg-data-dev-cus-001
+            └── vm-patientapp-data-dev-001 — 10.20.2.4
 ```
 
-## Objectives
+Both VMs used private IP addresses only. I attached the NSGs to the subnets instead of the individual network interfaces so that the same rules would apply to every resource placed in each tier.
 
-- Design a segmented Azure VNet
-- Create application, data, and management subnets
-- Configure Network Security Group rules
-- Apply NSG rule-priority logic
-- Configure VNet peering
-- Create and troubleshoot a user-defined route
-- Create an Azure Storage private endpoint
-- Configure Private DNS integration
-- Disable public Storage network access
-- Practice Azure networking troubleshooting
+## Resource Naming
+
+I used a consistent naming pattern throughout the lab:
+
+```text
+<resource-type>-<workload>-<tier>-<environment>-<region>-<instance>
+```
+
+Examples:
+
+- `rg-patientapp-net-dev`
+- `vnet-patientapp-dev-cus-001`
+- `snet-web-dev-cus-001`
+- `nsg-data-dev-cus-001`
+- `vm-patientapp-web-dev-001`
+
+In these names, `dev` represents the development environment and `cus` represents Central US.
 
 ## Implementation
 
-### 1. VNet and Subnet Segmentation
+### 1. Resource Group and Virtual Network
 
-Created:
+I created the lab in Central US with the following network settings:
 
-`vnet-patientapp-dev`
+| Resource | Configuration |
+|---|---|
+| Resource group | `rg-patientapp-net-dev` |
+| Region | `centralus` |
+| Virtual network | `vnet-patientapp-dev-cus-001` |
+| Address space | `10.20.0.0/16` |
 
-Address space:
+The first check confirmed that the resource group and VNet were both created in the correct region.
 
-`10.20.0.0/16`
+![Resource group and VNet region verification](screenshots/01-vnet-region-verification.png)
 
-The VNet was divided into three `/24` subnets:
+### 2. Subnet Segmentation
 
-| Subnet | Address Range | Purpose |
+I divided the VNet into two subnets so the web and data workloads could have different security rules.
+
+| Subnet | Address range | Purpose |
 |---|---|---|
-| `snet-app` | `10.20.1.0/24` | Application workloads |
-| `snet-data` | `10.20.2.0/24` | Private endpoints and data services |
-| `snet-mgmt` | `10.20.3.0/24` | Management workloads |
+| `snet-web-dev-cus-001` | `10.20.1.0/24` | Web-tier resources |
+| `snet-data-dev-cus-001` | `10.20.2.0/24` | Data-tier resources |
 
-This segmentation creates separate network boundaries for workloads with different security requirements.
+Separating the tiers does not block traffic by itself, but it gives me separate boundaries where I can apply the correct NSG rules.
 
-![VNet subnet configuration](images/vnet-subnets.png)
+### 3. Network Security Groups
 
-## 2. Network Security Group
+I created one NSG for each subnet and attached it at subnet scope.
 
-Created:
+| Subnet | Associated NSG |
+|---|---|
+| `snet-web-dev-cus-001` | `nsg-web-dev-cus-001` |
+| `snet-data-dev-cus-001` | `nsg-data-dev-cus-001` |
 
-`nsg-patientapp-app`
+![Subnet ranges and NSG associations](screenshots/02-subnet-nsg-associations.png)
 
-The application network was configured with two custom inbound RDP rules:
+The web NSG allowed HTTP traffic:
 
-| Priority | Rule | Source | Port | Action |
+| Priority | Rule | Source | Destination port | Protocol | Action |
+|---:|---|---|---:|---|---|
+| 100 | `Allow-HTTP-Internet` | `Internet` | 80 | TCP | Allow |
+
+The data NSG allowed the required SQL connection and denied other VNet traffic:
+
+| Priority | Rule | Source | Destination port | Protocol | Action |
+|---:|---|---|---:|---|---|
+| 100 | `Allow-SQL-From-WebSubnet` | `10.20.1.0/24` | 1433 | TCP | Allow |
+| 200 | `Deny-Other-VNet-Inbound` | `VirtualNetwork` | Any | Any | Deny |
+
+![Custom NSG rules for the web and data tiers](screenshots/03-custom-nsg-rules.png)
+
+NSGs process lower priority numbers first. That means traffic from the web subnet to port `1433` matches the priority `100` allow rule before it reaches the broader priority `200` deny rule. Other traffic from inside the VNet is denied.
+
+### 4. Private Virtual Machines
+
+I deployed two Microsoft Windows Server 2022 Datacenter: Azure Edition VMs. The selected size was `Standard_D2alds_v6` because it was available in the subscription and region during the lab.
+
+| VM | OS computer name | Subnet | Private IP | Public IP |
 |---|---|---|---|---|
-| 100 | Allow-RDP-From-Mgmt | `10.20.3.0/24` | TCP 3389 | Allow |
-| 200 | Deny-RDP-From-VNet | VirtualNetwork | TCP 3389 | Deny |
+| `vm-patientapp-web-dev-001` | Web-tier host | Web | `10.20.1.4` | None |
+| `vm-patientapp-data-dev-001` | `pa-data-001` | Data | `10.20.2.4` | None |
 
-![NSG inbound rules](images/nsg-inbound-rules.png)
+I did not attach extra NSGs to the NICs because each subnet already had the correct NSG.
 
-NSG rules are evaluated in priority order, with lower numbers evaluated first.
+![Private VM addresses and subnet placement](screenshots/04-vm-private-network-placement.png)
 
-The effective sequence is:
+### 5. Test Service on the Data VM
 
-```text
-100    Allow RDP from snet-mgmt
-200    Deny RDP from VirtualNetwork
-65000  AllowVNetInBound
-65001  AllowAzureLoadBalancerInBound
-65500  DenyAllInBound
-```
+To test an actual connection, I created a TCP listener on port `1433` on the data VM and added a matching Windows Defender Firewall rule. This gave the web VM a live service to connect to instead of testing the Azure configuration only on paper.
 
-This allows management hosts to use RDP while preventing other VNet sources from using RDP to application workloads.
+## Verified Results
 
-## 3. VNet Peering
+I ran the connection tests from the web VM at `10.20.1.4` to the data VM at `10.20.2.4`.
 
-Created a second virtual network:
+| Validation | Expected | Verified result |
+|---|---|---|
+| Resource group and VNet location | Central US | Passed |
+| Web subnet association | Web NSG attached | Passed |
+| Data subnet association | Data NSG attached | Passed |
+| TCP `1433` from web to data | Allowed | `True` |
+| TCP `3389` from web to data | Blocked | `False` |
+| IP Flow Verify for TCP `1433` | SQL allow rule | `Allow-SQL-From-WebSubnet` |
+| IP Flow Verify for TCP `3389` | Data-tier deny rule | `Deny-Other-VNet-Inbound` |
+| Resource group cleanup | Resource group removed | `false` |
 
-`vnet-sharedservices-dev`
+The runtime test showed that the web VM could reach the data VM on port `1433`, while RDP on port `3389` was blocked.
 
-Address space:
+![Successful SQL test and blocked RDP test](screenshots/05-segmented-connectivity-test.png)
 
-`10.30.0.0/16`
+I then used Network Watcher IP Flow Verify to identify the exact NSG rule behind each result. It confirmed that the SQL rule allowed port `1433` and the broader data-tier rule denied port `3389`.
 
-The application and shared-services VNets were connected using **VNet peering**.
+![IP Flow Verify allow and deny results](screenshots/06-ip-flow-verify-rule-results.png)
 
-![VNet peering](images/vnet-peering.png)
+## Evidence
 
-The VNet address spaces do not overlap:
+The screenshots above document the main stages of the lab:
 
-```text
-vnet-patientapp-dev:      10.20.0.0/16
-vnet-sharedservices-dev:  10.30.0.0/16
-```
-
-VNet peering provides private communication over the Azure backbone.
-
-An important limitation is that VNet peering is **not transitive**.
-
-## 4. User-Defined Routing
-
-Created:
-
-`rt-patientapp-app`
-
-As a troubleshooting exercise, a temporary user-defined route was configured:
-
-```text
-Destination: 10.30.0.0/16
-Next hop: None
-```
-
-![Intentional blackhole route](images/udr-blackhole-route.png)
-
-The route intentionally created a routing blackhole.
-
-Under normal conditions, Azure provides a system route through VNet peering:
-
-```text
-10.30.0.0/16 → Virtual network peering
-```
-
-The temporary UDR instead directed:
-
-```text
-10.30.0.0/16 → None
-```
-
-Traffic matching that route would be discarded.
-
-### Remediation
-
-The incorrect route was removed so Azure could again use the system route provided by VNet peering.
-
-![Route table after remediation](images/udr-route-fixed.png)
-
-This exercise reinforced two important Azure routing concepts:
-
-- User-defined routes can override system routes.
-- Azure uses longest-prefix matching when multiple routes match a destination.
-
-For example:
-
-```text
-10.30.0.0/16 → VNet peering
-10.30.1.0/24 → Virtual appliance
-```
-
-Traffic to `10.30.1.25` uses the `/24` route because it is more specific.
-
-## 5. Storage Private Endpoint
-
-The existing Storage account:
-
-`stpatientappdev280`
-
-was connected to the application network using **Azure Private Link**.
-
-The Blob private endpoint was created in:
-
-`snet-data`
-
-Target sub-resource:
-
-`blob`
-
-The private endpoint connection was successfully approved.
-
-![Approved Storage private endpoint](images/storage-private-endpoint-approved.png)
-
-Unlike a service endpoint, a private endpoint gives the Azure service a **private IP address inside the VNet**.
-
-This allows the Storage service to be accessed privately without relying on its public data endpoint.
-
-## 6. Private DNS
-
-Private DNS integration was configured using:
-
-`privatelink.blob.core.windows.net`
-
-An A record was created for the Storage account.
-
-The record resolves the Blob endpoint to:
-
-`10.20.2.4`
-
-![Private DNS Storage record](images/private-dns-st-record.png)
-
-Conceptually:
-
-```text
-stpatientappdev280.blob.core.windows.net
-                    ↓
-              Private DNS
-                    ↓
-               10.20.2.4
-                    ↓
-          Private Endpoint
-                    ↓
-            Azure Blob Storage
-```
-
-The private endpoint provides the private IP address.
-
-Private DNS ensures that applications resolve the normal Storage hostname to that private IP address.
-
-## 7. Disable Public Storage Access
-
-After Private Link and Private DNS were configured, public network access to the Storage account was disabled.
-
-![Storage public network access disabled](images/storage-public-access-disabled.png)
-
-The intended access path becomes:
-
-```text
-Application workload
-       ↓
-Private DNS
-       ↓
-10.20.2.4
-       ↓
-Private Endpoint
-       ↓
-Azure Blob Storage
-```
-
-Instead of:
-
-```text
-Internet
-   ↓
-Public Storage Endpoint
-```
-
-This reduces the public exposure of the Storage data endpoint.
+1. `01-vnet-region-verification.png` — resource group and VNet region
+2. `02-subnet-nsg-associations.png` — subnet ranges and NSG associations
+3. `03-custom-nsg-rules.png` — custom web-tier and data-tier rules
+4. `04-vm-private-network-placement.png` — VM private IPs and subnet placement
+5. `05-segmented-connectivity-test.png` — allowed TCP `1433` and blocked TCP `3389`
+6. `06-ip-flow-verify-rule-results.png` — the NSG rule responsible for each result
 
 ## Troubleshooting
 
-### Intentional Routing Failure
+### Cloud Shell Timed Out
 
-A temporary route was created:
+Cloud Shell timed out several times during the lab. When the session restarted, variables I had created earlier were gone, which caused later commands to fail or reference incomplete resource paths.
 
-```text
-10.30.0.0/16 → None
-```
+**Fix:** I reopened Cloud Shell and used self-contained commands with the full resource names. This made the commands easier to rerun after a timeout.
 
-This caused traffic destined for the shared-services VNet to be discarded instead of using VNet peering.
+### Windows Computer Name Was Too Long
 
-The issue was corrected by removing the UDR and restoring the Azure system peering route.
+The first attempt to create the data VM failed because Azure tried to use the VM resource name as the Windows computer name. Windows computer names have a 15-character limit.
 
-This demonstrated the importance of checking:
+**Fix:** I kept the descriptive Azure resource name `vm-patientapp-data-dev-001`, but used `pa-data-001` as the shorter Windows computer name.
 
-- Route tables
-- Destination prefixes
-- Next-hop types
-- System routes
-- User-defined routes
+### Preferred VM Size Was Unavailable
 
-during connectivity troubleshooting.
+The smaller VM size I originally planned to use was not available for this subscription and region.
 
-### VM Deployment Limitation
+**Fix:** I selected an available two-vCPU size for the temporary lab and deleted the resource group after testing so the VM would not continue generating charges.
 
-A test VM was planned to validate:
+### Connection Test Ran From the Wrong VM
 
-- DNS resolution
-- Effective routes
-- Private endpoint connectivity
+I first ran the connection test from the data VM to itself. Both ports returned `True`, but that result did not test traffic crossing from the web subnet to the data subnet.
 
-The lab subscription did not expose an available VM SKU in East US despite available regional vCPU quota.
+**Fix:** I checked the source hostname and IP address, then reran the test from the web VM at `10.20.1.4`. The correct results were TCP `1433 = True` and TCP `3389 = False`.
 
-The Microsoft.Compute resource provider and quota availability were verified, but VM SKU availability remained restricted for the subscription.
+### Third-Party Marketplace Image Appeared First
 
-Rather than redesigning the network around a subscription-specific limitation, configuration was validated using Azure control-plane resources.
+The first Windows Server result in the Azure Marketplace was published by a third party instead of Microsoft.
 
-## Validation Results
-
-| Test | Expected Result | Result |
-|---|---|---|
-| Application VNet | `10.20.0.0/16` | Passed |
-| Application subnet | `10.20.1.0/24` | Passed |
-| Data subnet | `10.20.2.0/24` | Passed |
-| Management subnet | `10.20.3.0/24` | Passed |
-| Management RDP rule | Management subnet allowed | Passed |
-| Broader VNet RDP rule | Other VNet RDP denied | Passed |
-| VNet peering | Connected | Passed |
-| Blackhole UDR | Traffic routed to None | Passed |
-| UDR remediation | Incorrect route removed | Passed |
-| Blob private endpoint | Connection approved | Passed |
-| Private DNS | Blob hostname mapped to `10.20.2.4` | Passed |
-| Storage public access | Disabled | Passed |
-| Runtime VM test | SKU unavailable in lab subscription | Not completed |
+**Fix:** I checked the publisher and selected the Microsoft Windows Server 2022 image.
 
 ## Security Decisions
 
-### Network Segmentation
+- **Separate subnets:** The web and data tiers were placed in different subnets so each tier could have its own security policy.
+- **Limited data-tier access:** Only TCP `1433` was allowed from the web subnet to the data subnet.
+- **Explicit deny rule:** Other inbound traffic from the VNet to the data subnet was blocked.
+- **No public IP addresses:** Neither VM was directly reachable from the internet.
+- **Subnet-level NSGs:** Security rules applied consistently to resources placed in each subnet.
+- **Two types of validation:** `Test-NetConnection` proved the real connection behavior, and IP Flow Verify showed which NSG rule caused it.
 
-Application, data, and management workloads were separated into dedicated subnets.
+## What I Learned
 
-### Restricted Management Traffic
+- NSG rules are evaluated by priority, with lower numbers processed first.
+- A specific allow rule can be placed ahead of a broader deny rule to permit only the required traffic.
+- A connection test is only useful if it runs from the correct source and targets the correct destination.
+- `Test-NetConnection` shows whether a port is reachable, while IP Flow Verify explains which NSG rule allows or denies the traffic.
+- Azure VM resource names and Windows computer names follow different naming limits.
+- Cloud Shell sessions and variables can disappear after a timeout, so repeatable commands should not depend on old session variables.
+- Separate private subnets do not automatically create security. The traffic still needs to be controlled and tested.
 
-RDP access was allowed from the management subnet while broader VNet RDP traffic was explicitly denied.
+## Cost and Cleanup
 
-### Private Storage Connectivity
+I kept the VMs running only long enough to finish the connection tests and capture the evidence. After the lab, I deleted the entire resource group:
 
-Azure Private Link was used to provide Blob Storage with private connectivity inside the VNet.
+```bash
+az group delete \
+  --name "rg-patientapp-net-dev" \
+  --yes \
+  --no-wait
+```
 
-### Private DNS Resolution
+I verified the deletion with:
 
-Private DNS allows applications to use standard Azure Storage hostnames while resolving them to private endpoint addresses.
+```bash
+az group exists --name "rg-patientapp-net-dev"
+```
 
-### Public Endpoint Isolation
+Verified output:
 
-Public network access to the Storage account was disabled after private connectivity was established.
+```text
+false
+```
 
-## Key Azure Concepts Demonstrated
+This removed the VNet, subnets, NSGs, NICs, disks, and VMs created for the lab.
 
-- Azure Virtual Networks
-- CIDR addressing
-- Subnets
-- Network Security Groups
-- NSG priorities
-- Default NSG rules
-- VNet peering
-- Non-transitive peering
-- Route tables
-- User-defined routes
-- Next-hop types
-- Longest-prefix matching
-- Azure system routes
-- Azure Private Link
-- Private endpoints
-- Private DNS zones
-- DNS A records
-- Storage network isolation
-- Public network access
-- Network troubleshooting
+## AZ-104 Skills Demonstrated
 
-## Lessons Learned
-
-This project reinforced that successful Azure networking depends on several independent layers working together.
-
-**NSGs** determine whether traffic is permitted.
-
-**Route tables** determine where permitted traffic is sent.
-
-**VNet peering** provides private network connectivity but does not provide transitive routing.
-
-**Private endpoints** provide Azure services with private connectivity inside a VNet.
-
-**Private DNS** ensures service hostnames resolve to the correct private endpoint IP.
-
-The routing exercise demonstrated that even when VNet peering is correctly configured, a user-defined route can override the expected route and break connectivity.
-
-A useful troubleshooting sequence is:
-
-1. Check DNS resolution
-2. Check NSG rules
-3. Check effective routes and route tables
-4. Verify VNet peering
-5. Verify private endpoint status
-6. Verify service-level network restrictions
-
-## Cleanup and Cost Notes
-
-Most resources in this lab have relatively low ongoing cost, although Azure Private Link can generate usage charges.
-
-The test VM was not deployed because of subscription SKU restrictions, avoiding ongoing compute charges.
-
-Resources can be removed after portfolio validation if they are no longer required.
-
-The existing Storage account is reused across multiple AZ-104 portfolio projects.
+- Created and configured an Azure VNet and subnets
+- Planned private IPv4 address ranges using CIDR notation
+- Created and associated subnet-level NSGs
+- Configured rule priorities for allowed and denied traffic
+- Deployed private Windows Server VMs into specific subnets
+- Used Azure VM Run Command to configure and test the VMs
+- Tested port connectivity with PowerShell
+- Used Network Watcher IP Flow Verify to troubleshoot NSG behavior
+- Verified Azure resources with Azure CLI
+- Deleted and confirmed the cleanup of temporary Azure resources
